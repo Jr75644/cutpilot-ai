@@ -387,6 +387,43 @@ def escape_drawtext(text: str) -> str:
     return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'").replace("%", "\\%")
 
 
+def srt_time(seconds: float) -> str:
+    ms = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, milli = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
+
+
+def create_srt(folder: Path, plan: dict[str, Any]) -> Path | None:
+    transcript = read_json(folder / "transcript.json", []) or []
+    if not transcript:
+        return None
+    rows = []
+    timeline_cursor = 0.0
+    index = 1
+    for clip in plan.get("segments", []):
+        source_start = float(clip["start"])
+        source_end = float(clip["end"])
+        clip_duration = source_end - source_start
+        for speech in transcript:
+            overlap_start = max(source_start, float(speech["start"]))
+            overlap_end = min(source_end, float(speech["end"]))
+            text = str(speech.get("text", "")).strip()
+            if overlap_end <= overlap_start or not text:
+                continue
+            out_start = timeline_cursor + (overlap_start - source_start)
+            out_end = timeline_cursor + (overlap_end - source_start)
+            rows.append(f"{index}\n{srt_time(out_start)} --> {srt_time(out_end)}\n{text}\n")
+            index += 1
+        timeline_cursor += clip_duration
+    if not rows:
+        return None
+    path = folder / "captions.srt"
+    path.write_text("\n".join(rows), encoding="utf-8")
+    return path
+
+
 def finish_render(cuts: Path, output: Path, folder: Path, plan: dict[str, Any], config: dict[str, Any]) -> None:
     cmd = ["ffmpeg", "-y", "-i", str(cuts)]
     voice_inputs = []
@@ -405,6 +442,18 @@ def finish_render(cuts: Path, output: Path, folder: Path, plan: dict[str, Any], 
 
     filters = []
     vf = []
+    if bool(config.get("burn_captions", True)):
+        srt = create_srt(folder, plan)
+        if srt:
+            escaped_srt = str(srt).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+            caption_style = str(config.get("caption_style", "social"))
+            if caption_style == "minimal":
+                style = "FontName=DejaVu Sans,FontSize=18,Outline=1,Alignment=2,MarginV=42"
+            elif caption_style == "clean":
+                style = "FontName=DejaVu Sans,FontSize=22,Bold=1,Outline=2,Alignment=2,MarginV=56"
+            else:
+                style = "FontName=DejaVu Sans,FontSize=28,Bold=1,Outline=3,Shadow=1,Alignment=2,MarginV=72"
+            vf.append(f"subtitles='{escaped_srt}':force_style='{style}'")
     headline = str(plan.get("headline", "")).strip()
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     if headline:
