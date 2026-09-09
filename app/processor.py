@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import shlex
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,16 +14,15 @@ from scenedetect import SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 
 from .models import AIEditPlan
-from .storage import job_dir, plan_path, read_json, write_json
+from .storage import config_path, job_dir, plan_path, read_json, write_json
 
 StatusWriter = Callable[[str, dict[str, Any]], None]
 
 
-def run(cmd: list[str]) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode:
-        pretty = " ".join(shlex.quote(x) for x in cmd)
-        raise RuntimeError(f"Command failed: {pretty}\n{proc.stderr[-4000:]}")
+def run(cmd: list[str], cwd: Path | None = None) -> str:
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(x) for x in cmd)}\n{proc.stderr[-5000:]}")
     return proc.stdout
 
 
@@ -34,11 +35,11 @@ def ffprobe_duration(path: Path) -> float:
 
 
 def has_audio(path: Path) -> bool:
-    proc = subprocess.run([
+    out = run([
         "ffprobe", "-v", "error", "-select_streams", "a:0",
         "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
-    ], capture_output=True, text=True)
-    return proc.returncode == 0 and "audio" in proc.stdout
+    ]).strip()
+    return "audio" in out
 
 
 def detect_scenes(path: Path, duration: float) -> list[dict[str, Any]]:
@@ -46,8 +47,9 @@ def detect_scenes(path: Path, duration: float) -> list[dict[str, Any]]:
     manager = SceneManager()
     manager.add_detector(ContentDetector(threshold=float(os.getenv("SCENE_THRESHOLD", "27"))))
     manager.detect_scenes(video)
-    result = []
-    for i, (start_tc, end_tc) in enumerate(manager.get_scene_list()):
+    scenes = manager.get_scene_list()
+    result: list[dict[str, Any]] = []
+    for i, (start_tc, end_tc) in enumerate(scenes):
         start = max(0.0, start_tc.get_seconds())
         end = min(duration, end_tc.get_seconds())
         if end - start >= 0.12:
@@ -61,91 +63,126 @@ def detect_scenes(path: Path, duration: float) -> list[dict[str, Any]]:
 
 
 def extract_frames(path: Path, scenes: list[dict[str, Any]], folder: Path, max_frames: int = 16) -> list[dict[str, Any]]:
-    frame_dir = folder / "frames"
-    frame_dir.mkdir(exist_ok=True)
-    if len(scenes) > max_frames:
-        step = (len(scenes) - 1) / (max_frames - 1)
-        selected = [scenes[round(i * step)] for i in range(max_frames)]
+    thumbs = folder / "frames"
+    thumbs.mkdir(exist_ok=True)
+    if len(scenes) <= max_frames:
+        picked = scenes
     else:
-        selected = scenes
-    frames = []
-    seen = set()
-    for scene in selected:
-        if scene["id"] in seen:
-            continue
-        seen.add(scene["id"])
-        at = scene["start"] + scene["duration"] / 2
-        out = frame_dir / f"scene-{scene['id']:03d}.jpg"
+        step = (len(scenes) - 1) / (max_frames - 1)
+        indices = sorted({round(i * step) for i in range(max_frames)})
+        picked = [scenes[i] for i in indices]
+
+    frames: list[dict[str, Any]] = []
+    for scene in picked:
+        mid = scene["start"] + (scene["end"] - scene["start"]) / 2
+        outfile = thumbs / f"scene-{scene['id']:03d}.jpg"
         run([
-            "ffmpeg", "-y", "-ss", f"{at:.3f}", "-i", str(path),
-            "-frames:v", "1", "-vf", "scale='min(960,iw)':-2", "-q:v", "4", str(out),
+            "ffmpeg", "-y", "-ss", f"{mid:.3f}", "-i", str(path),
+            "-frames:v", "1", "-vf", "scale='min(960,iw)':-2", "-q:v", "4", str(outfile),
         ])
-        frames.append({"scene_id": scene["id"], "time": round(at, 3), "path": out})
+        frames.append({"scene_id": scene["id"], "time": round(mid, 3), "path": outfile})
     return frames
 
 
 def extract_audio(path: Path, folder: Path) -> Path | None:
     if not has_audio(path):
         return None
-    out = folder / "source-audio.mp3"
-    run(["ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "96k", str(out)])
-    return out
+    audio = folder / "source-audio.mp3"
+    run(["ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "96k", str(audio)])
+    return audio
 
 
-def transcribe(audio: Path | None) -> list[dict[str, Any]]:
-    if not audio:
-        return []
-    if os.getenv("TRANSCRIBE_PROVIDER", "openai").lower() == "local":
-        from faster_whisper import WhisperModel
-        model = WhisperModel(
-            os.getenv("WHISPER_MODEL", "small"),
-            device=os.getenv("WHISPER_DEVICE", "cpu"),
-            compute_type=os.getenv("WHISPER_COMPUTE", "int8"),
-        )
-        segments, _ = model.transcribe(str(audio), vad_filter=True)
-        return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segments]
-
-    if not os.getenv("OPENAI_API_KEY"):
-        return []
-
+def transcribe_openai(audio: Path) -> list[dict[str, Any]]:
     from openai import OpenAI
+
     client = OpenAI()
+    model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
     with audio.open("rb") as f:
         resp = client.audio.transcriptions.create(
-            model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1"),
+            model=model,
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
         )
+    raw_segments = getattr(resp, "segments", None) or []
     result = []
-    for seg in getattr(resp, "segments", None) or []:
+    for seg in raw_segments:
         if isinstance(seg, dict):
-            result.append({"start": float(seg.get("start", 0)), "end": float(seg.get("end", 0)), "text": str(seg.get("text", "")).strip()})
+            start, end, text = seg.get("start", 0), seg.get("end", 0), seg.get("text", "")
         else:
-            result.append({"start": float(seg.start), "end": float(seg.end), "text": str(seg.text).strip()})
+            start, end, text = getattr(seg, "start", 0), getattr(seg, "end", 0), getattr(seg, "text", "")
+        result.append({"start": float(start), "end": float(end), "text": str(text).strip()})
+    if not result:
+        text = getattr(resp, "text", "") or ""
+        if text.strip():
+            result = [{"start": 0.0, "end": ffprobe_duration(audio), "text": text.strip()}]
     return result
 
 
+def transcribe_local(audio: Path) -> list[dict[str, Any]]:
+    from faster_whisper import WhisperModel
+
+    size = os.getenv("WHISPER_MODEL", "small")
+    model = WhisperModel(
+        size,
+        device=os.getenv("WHISPER_DEVICE", "cpu"),
+        compute_type=os.getenv("WHISPER_COMPUTE", "int8"),
+    )
+    segments, _info = model.transcribe(str(audio), vad_filter=True)
+    return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segments]
+
+
+def transcribe(audio: Path | None) -> list[dict[str, Any]]:
+    if audio is None:
+        return []
+    provider = os.getenv("TRANSCRIBE_PROVIDER", "openai").lower()
+    if provider == "local":
+        return transcribe_local(audio)
+    if not os.getenv("OPENAI_API_KEY"):
+        return []
+    return transcribe_openai(audio)
+
+
 def transcript_for_scene(scene: dict[str, Any], transcript: list[dict[str, Any]]) -> str:
-    return " ".join(
-        s["text"] for s in transcript
-        if s["end"] >= scene["start"] and s["start"] <= scene["end"]
-    ).strip()
+    chunks = []
+    for seg in transcript:
+        if seg["end"] >= scene["start"] and seg["start"] <= scene["end"]:
+            chunks.append(seg["text"])
+    return " ".join(chunks).strip()
 
 
-def data_url(path: Path) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+def image_data_url(path: Path) -> str:
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 
-def heuristic_plan(scenes: list[dict[str, Any]], narration: str, sfx_at: float | None) -> dict[str, Any]:
-    return sanitize_plan({
-        "summary": "AI key is not configured, so all detected scenes were kept.",
-        "segments": [{"scene_id": s["id"], "start": s["start"], "end": s["end"], "reason": "Fallback keep"} for s in scenes],
+def heuristic_plan(scenes: list[dict[str, Any]], narration: str, overlay_audio_at: float | None) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "summary": "Fallback timeline: all detected scenes retained in chronological order.",
+        "segments": [
+            {"scene_id": s["id"], "start": s["start"], "end": s["end"], "reason": "Fallback keep"}
+            for s in scenes
+        ],
         "headline": "",
-        "voiceover": [{"at": 0.2, "text": narration}] if narration else [],
+        "voiceover": ([{"at": 0.2, "text": narration}] if narration else []),
         "text_overlays": [],
-        "overlay_audio_at": sfx_at,
-    }, scenes, narration, sfx_at)
+        "overlay_audio_at": overlay_audio_at,
+    }
+
+
+def _extract_parsed_response(resp: Any) -> Any | None:
+    parsed = getattr(resp, "output_parsed", None)
+    if parsed is not None:
+        return parsed
+    for output in getattr(resp, "output", []) or []:
+        if getattr(output, "type", "") != "message":
+            continue
+        for item in getattr(output, "content", []) or []:
+            item_parsed = getattr(item, "parsed", None)
+            if item_parsed is not None:
+                return item_parsed
+    return None
 
 
 def ai_plan(
@@ -154,226 +191,350 @@ def ai_plan(
     scenes: list[dict[str, Any]],
     transcript: list[dict[str, Any]],
     frames: list[dict[str, Any]],
-    sfx_at: float | None,
+    overlay_audio_at: float | None,
 ) -> dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
-        return heuristic_plan(scenes, narration, sfx_at)
+        return heuristic_plan(scenes, narration, overlay_audio_at)
 
     from openai import OpenAI
+
     client = OpenAI()
-    manifest = [{
-        "id": s["id"],
-        "start": s["start"],
-        "end": s["end"],
-        "duration": s["duration"],
-        "speech": transcript_for_scene(s, transcript)[:900],
-    } for s in scenes]
+    model = os.getenv("OPENAI_EDITOR_MODEL", "gpt-5.6-luna")
 
-    instructions = f"""You are CutPilot, an AI non-linear video editor.
-Create an executable edit decision list from the user's request.
+    scene_manifest = [
+        {
+            "id": s["id"],
+            "start": s["start"],
+            "end": s["end"],
+            "duration": s["duration"],
+            "speech": transcript_for_scene(s, transcript)[:900],
+        }
+        for s in scenes
+    ]
 
-Rules:
-- Use only supplied scenes and ORIGINAL source timestamps.
-- Every segment must remain inside its scene.
-- Keep segments chronological and non-overlapping.
-- Prefer natural cuts and useful story context.
-- Do not invent visible events.
-- voiceover.at and text_overlays.at are FINAL timeline seconds.
-- Use supplied narration verbatim unless the user asks for a rewrite.
-- If the user says no music, do not recommend or add music.
-- overlay_audio_at is FINAL timeline seconds for the uploaded SFX, or null.
-- Keep text overlays sparse and short.
+    instructions = f"""You are CutPilot, an AI non-linear video editor. Build an executable edit decision list from the user's request.
 
-USER REQUEST:
+Important rules:
+- Every video segment MUST stay within one supplied scene, using ORIGINAL source time coordinates.
+- Segments must be chronological and non-overlapping.
+- Do not invent footage or events that are not visible/heard in the supplied material.
+- Prefer natural cut points. Avoid clips under 0.35 seconds unless the prompt clearly calls for fast cutting.
+- Keep context that is necessary for the requested story to make sense.
+- voiceover.at and text_overlays.at are seconds on the FINAL edited timeline.
+- If exact narration is provided, use it verbatim unless the user explicitly asks you to rewrite it.
+- If the user says no music, do not add or recommend music.
+- overlay_audio_at is the final-timeline time for the uploaded extra audio/SFX; use null when it should not be used.
+- The headline should be short and empty when a headline would not improve the edit.
+- Text overlays are optional and should be sparse, purposeful, and short.
+
+USER EDIT REQUEST:
 {prompt}
 
-NARRATION:
-{narration or "(none)"}
+EXACT/OPTIONAL NARRATION:
+{narration or '(none)'}
 
-REQUESTED SFX TIME:
-{sfx_at}
+EXPLICIT SFX TIME (if any):
+{overlay_audio_at}
 
-SCENES:
-{json.dumps(manifest)}
+SCENE MANIFEST:
+{json.dumps(scene_manifest)}
 """
 
     content: list[dict[str, Any]] = [{"type": "input_text", "text": instructions}]
     for frame in frames:
-        content.append({"type": "input_text", "text": f"Scene {frame['scene_id']} frame at {frame['time']}s"})
-        content.append({"type": "input_image", "image_url": data_url(frame["path"])})
+        content.append({
+            "type": "input_text",
+            "text": f"Representative frame: scene {frame['scene_id']} at original time {frame['time']} seconds",
+        })
+        content.append({"type": "input_image", "image_url": image_data_url(frame["path"])})
 
-    response = client.responses.parse(
-        model=os.getenv("OPENAI_EDITOR_MODEL", "gpt-5.6-luna"),
+    resp = client.responses.parse(
+        model=model,
         input=[{"role": "user", "content": content}],
         text_format=AIEditPlan,
     )
-    parsed = getattr(response, "output_parsed", None)
+    parsed = _extract_parsed_response(resp)
     if parsed is None:
-        for item in getattr(response, "output", []) or []:
-            for part in getattr(item, "content", []) or []:
-                parsed = getattr(part, "parsed", None) or parsed
-    if parsed is None:
-        raise RuntimeError("AI planner did not return structured output")
-    raw = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
-    return sanitize_plan(raw, scenes, narration, sfx_at)
+        raise RuntimeError("AI editor did not return a structured edit plan")
+    if hasattr(parsed, "model_dump"):
+        raw = parsed.model_dump()
+    elif isinstance(parsed, dict):
+        raw = parsed
+    else:
+        raw = json.loads(str(parsed))
+    return sanitize_plan(raw, scenes, narration, overlay_audio_at)
 
 
-def sanitize_plan(plan: dict[str, Any], scenes: list[dict[str, Any]], narration: str, sfx_at: float | None) -> dict[str, Any]:
+def _dedupe_and_order_segments(clean: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clean.sort(key=lambda x: (x["start"], x["end"]))
+    ordered: list[dict[str, Any]] = []
+    last_end = -1.0
+    for seg in clean:
+        if seg["start"] < last_end - 1e-6:
+            continue
+        ordered.append(seg)
+        last_end = seg["end"]
+    return ordered
+
+
+def sanitize_plan(
+    plan: dict[str, Any],
+    scenes: list[dict[str, Any]],
+    narration: str,
+    overlay_audio_at: float | None,
+    *,
+    preserve_order: bool = False,
+) -> dict[str, Any]:
     by_id = {int(s["id"]): s for s in scenes}
-    clean = []
-    for raw in plan.get("segments", []):
+    clean: list[dict[str, Any]] = []
+    for seg in plan.get("segments", []):
         try:
-            sid = int(raw["scene_id"])
+            sid = int(seg.get("scene_id"))
             scene = by_id[sid]
-            start = max(float(scene["start"]), float(raw.get("start", scene["start"])))
-            end = min(float(scene["end"]), float(raw.get("end", scene["end"])))
+            start = max(float(scene["start"]), float(seg.get("start", scene["start"])))
+            end = min(float(scene["end"]), float(seg.get("end", scene["end"])))
             if end - start < 0.12:
                 continue
             clean.append({
+                "clip_id": str(seg.get("clip_id") or "")[:120] or None,
                 "scene_id": sid,
                 "start": round(start, 3),
                 "end": round(end, 3),
-                "reason": str(raw.get("reason", "AI selected"))[:500],
+                "reason": str(seg.get("reason", "AI selected"))[:500],
             })
         except Exception:
             continue
-    clean.sort(key=lambda x: (x["start"], x["end"]))
-    ordered = []
-    last_end = -1.0
-    for seg in clean:
-        if seg["start"] >= last_end - 1e-6:
-            ordered.append(seg)
-            last_end = seg["end"]
-    if not ordered:
-        ordered = [{"scene_id": s["id"], "start": s["start"], "end": s["end"], "reason": "Safety fallback"} for s in scenes]
+    if not preserve_order:
+        clean = _dedupe_and_order_segments(clean)
+    if not clean:
+        clean = [dict(item) for item in heuristic_plan(scenes, narration, overlay_audio_at)["segments"]]
+    edit_duration = max(0.1, sum(float(seg["end"]) - float(seg["start"]) for seg in clean))
 
-    voiceover = []
+    vo = []
     for item in plan.get("voiceover", []):
-        text = str(item.get("text", "")).strip()
-        if text:
-            voiceover.append({"at": max(0.0, float(item.get("at", 0))), "text": text[:4000]})
-    if narration and not voiceover:
-        voiceover = [{"at": 0.2, "text": narration}]
+        try:
+            text = str(item.get("text", "")).strip()
+            if text:
+                vo.append({
+                    "id": str(item.get("id") or "")[:120] or None,
+                    "at": min(edit_duration, max(0.0, float(item.get("at", 0.0)))),
+                    "text": text[:4000],
+                })
+        except Exception:
+            pass
+    if narration and not vo:
+        vo = [{"id": None, "at": 0.2, "text": narration}]
 
     overlays = []
     for item in plan.get("text_overlays", []):
-        text = str(item.get("text", "")).strip()
-        if text:
+        try:
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            position = str(item.get("position", "center"))
+            if position not in {"top", "center", "bottom"}:
+                position = "center"
             overlays.append({
-                "at": max(0.0, float(item.get("at", 0))),
-                "duration": max(0.25, float(item.get("duration", 2.5))),
+                "id": str(item.get("id") or "")[:120] or None,
+                "at": min(edit_duration, max(0.0, float(item.get("at", 0.0)))),
+                "duration": max(0.25, min(edit_duration, 120.0, float(item.get("duration", 2.5)))),
                 "text": text[:220],
-                "position": item.get("position", "center") if item.get("position") in {"top", "center", "bottom"} else "center",
+                "position": position,
             })
+        except Exception:
+            continue
 
-    result = {
-        "version": 2,
-        "summary": str(plan.get("summary", "Timeline ready"))[:1200],
-        "segments": ordered,
+    oa = plan.get("overlay_audio_at", overlay_audio_at)
+    try:
+        oa = None if oa is None else min(edit_duration, max(0.0, float(oa)))
+    except Exception:
+        oa = overlay_audio_at
+
+    normalized = {
+        "version": 3,
+        "summary": str(plan.get("summary", "AI-generated edit timeline"))[:1200],
+        "segments": clean,
         "headline": str(plan.get("headline", ""))[:140],
-        "voiceover": voiceover,
+        "voiceover": vo,
         "text_overlays": overlays,
-        "overlay_audio_at": plan.get("overlay_audio_at", sfx_at),
+        "overlay_audio_at": oa,
     }
-    result["timeline"] = build_timeline(result)
-    return result
-
-
-def sanitize_saved_plan(plan: dict[str, Any], scenes: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
-    return sanitize_plan(plan, scenes, config.get("narration_text", ""), config.get("overlay_audio_at"))
+    normalized["timeline"] = build_timeline(normalized)
+    return normalized
 
 
 def build_timeline(plan: dict[str, Any]) -> dict[str, Any]:
-    video_clips = []
     cursor = 0.0
-    for i, seg in enumerate(plan["segments"]):
-        dur = seg["end"] - seg["start"]
+    video_clips = []
+    for i, seg in enumerate(plan.get("segments", [])):
+        length = max(0.0, float(seg["end"]) - float(seg["start"]))
         video_clips.append({
-            "id": f"video-{i}",
+            "id": seg.get("clip_id") or f"v-{i + 1:03d}",
             "kind": "video",
-            "scene_id": seg["scene_id"],
-            "source_start": seg["start"],
-            "source_end": seg["end"],
+            "scene_id": int(seg["scene_id"]),
+            "source_start": round(float(seg["start"]), 3),
+            "source_end": round(float(seg["end"]), 3),
             "timeline_start": round(cursor, 3),
-            "timeline_end": round(cursor + dur, 3),
-            "label": f"Scene {seg['scene_id'] + 1}",
-            "reason": seg["reason"],
+            "timeline_end": round(cursor + length, 3),
+            "label": f"Scene {int(seg['scene_id']) + 1}",
+            "reason": seg.get("reason", "AI selected"),
         })
-        cursor += dur
+        cursor += length
 
-    text_clips = [{
-        "id": f"text-{i}", "kind": "text", "timeline_start": float(x["at"]),
-        "timeline_end": float(x["at"]) + float(x["duration"]), "label": x["text"][:30],
-        "text": x["text"], "position": x["position"],
-    } for i, x in enumerate(plan.get("text_overlays", []))]
-
-    voice_clips = [{
-        "id": f"voice-{i}", "kind": "voiceover", "timeline_start": float(x["at"]),
-        "timeline_end": float(x["at"]) + 3.0, "label": "AI Voice", "text": x["text"],
-    } for i, x in enumerate(plan.get("voiceover", []))]
-
+    voice_clips = [
+        {
+            "id": v.get("id") or f"vo-{i + 1:02d}",
+            "kind": "voiceover",
+            "timeline_start": round(float(v.get("at", 0)), 3),
+            "timeline_end": round(float(v.get("at", 0)) + 3.0, 3),
+            "text": v.get("text", ""),
+            "label": "AI Voice",
+        }
+        for i, v in enumerate(plan.get("voiceover", []))
+    ]
+    text_clips = [
+        {
+            "id": v.get("id") or f"tx-{i + 1:02d}",
+            "kind": "text",
+            "timeline_start": round(float(v.get("at", 0)), 3),
+            "timeline_end": round(float(v.get("at", 0)) + float(v.get("duration", 2.5)), 3),
+            "text": v.get("text", ""),
+            "position": v.get("position", "center"),
+            "label": str(v.get("text", "Text"))[:30] or "Text",
+        }
+        for i, v in enumerate(plan.get("text_overlays", []))
+    ]
     sfx_clips = []
     if plan.get("overlay_audio_at") is not None:
-        at = max(0.0, float(plan["overlay_audio_at"]))
-        sfx_clips = [{"id": "sfx-0", "kind": "sfx", "timeline_start": at, "timeline_end": at + 1.5, "label": "Uploaded SFX"}]
+        at = float(plan["overlay_audio_at"])
+        sfx_clips.append({
+            "id": "sfx-01",
+            "kind": "sfx",
+            "timeline_start": round(at, 3),
+            "timeline_end": round(at + 1.0, 3),
+            "label": "Uploaded SFX",
+        })
 
-    duration = max([cursor] + [c["timeline_end"] for c in text_clips + voice_clips + sfx_clips])
     return {
-        "duration": round(duration, 3),
+        "duration": round(max(0.1, cursor), 3),
         "tracks": [
-            {"id": "video", "kind": "video", "label": "Video 1", "clips": video_clips},
-            {"id": "text", "kind": "text", "label": "Text", "clips": text_clips},
-            {"id": "voice", "kind": "voiceover", "label": "Voiceover", "clips": voice_clips},
-            {"id": "sfx", "kind": "sfx", "label": "SFX", "clips": sfx_clips},
+            {"id": "video-1", "kind": "video", "label": "Video 1", "clips": video_clips},
+            {"id": "text-1", "kind": "text", "label": "Text", "clips": text_clips},
+            {"id": "voice-1", "kind": "voiceover", "label": "Voiceover", "clips": voice_clips},
+            {"id": "sfx-1", "kind": "sfx", "label": "SFX", "clips": sfx_clips},
         ],
     }
 
 
-def aspect_filter(aspect: str) -> str | None:
-    if aspect == "9:16":
-        return "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920"
-    if aspect == "16:9":
-        return "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)',scale=1920:1080"
-    if aspect == "1:1":
-        return "crop='min(iw,ih)':'min(iw,ih)',scale=1080:1080"
-    if aspect == "4:5":
-        return "crop='min(iw,ih*4/5)':'min(ih,iw*5/4)',scale=1080:1350"
-    return None
+def sanitize_saved_plan(plan: dict[str, Any], scenes: list[dict[str, Any]], config: dict[str, Any]) -> dict[str, Any]:
+    candidate = dict(plan)
+    timeline = candidate.get("timeline", {})
+    tracks = timeline.get("tracks", []) if isinstance(timeline, dict) else []
 
-
-def render_cuts(source: Path, segments: list[dict[str, Any]], folder: Path, keep_audio: bool, aspect: str) -> Path:
-    clip_dir = folder / "render-clips"
-    clip_dir.mkdir(exist_ok=True)
-    clip_paths = []
-    vf = aspect_filter(aspect)
-    for i, seg in enumerate(segments):
-        out = clip_dir / f"{i:03d}.mp4"
-        cmd = [
-            "ffmpeg", "-y", "-ss", f"{seg['start']:.3f}", "-to", f"{seg['end']:.3f}",
-            "-i", str(source),
+    video = next((t for t in tracks if t.get("kind") == "video"), None)
+    if video:
+        clips = sorted(video.get("clips", []), key=lambda clip: float(clip.get("timeline_start", 0)))
+        candidate["segments"] = [
+            {
+                "clip_id": clip.get("id"),
+                "scene_id": clip.get("scene_id"),
+                "start": clip.get("source_start"),
+                "end": clip.get("source_end"),
+                "reason": clip.get("reason", "Manual timeline edit"),
+            }
+            for clip in clips
         ]
-        if vf:
-            cmd += ["-vf", vf]
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-        if keep_audio and has_audio(source):
-            cmd += ["-c:a", "aac", "-b:a", "160k"]
+
+    text_track = next((t for t in tracks if t.get("kind") == "text"), None)
+    if text_track is not None:
+        candidate["text_overlays"] = [
+            {
+                "id": clip.get("id"),
+                "at": clip.get("timeline_start", 0),
+                "duration": max(0.25, float(clip.get("timeline_end", 0)) - float(clip.get("timeline_start", 0))),
+                "text": clip.get("text", clip.get("label", "")),
+                "position": clip.get("position", "center"),
+            }
+            for clip in text_track.get("clips", [])
+        ]
+
+    voice_track = next((t for t in tracks if t.get("kind") == "voiceover"), None)
+    if voice_track is not None:
+        candidate["voiceover"] = [
+            {"id": clip.get("id"), "at": clip.get("timeline_start", 0), "text": clip.get("text", "")}
+            for clip in voice_track.get("clips", [])
+        ]
+
+    sfx_track = next((t for t in tracks if t.get("kind") == "sfx"), None)
+    if sfx_track is not None:
+        clips = sorted(sfx_track.get("clips", []), key=lambda clip: float(clip.get("timeline_start", 0)))
+        candidate["overlay_audio_at"] = clips[0].get("timeline_start") if clips else None
+
+    return sanitize_plan(
+        candidate,
+        scenes,
+        str(config.get("narration_text", "")),
+        config.get("overlay_audio_at"),
+        preserve_order=True,
+    )
+
+def aspect_filter(aspect_ratio: str) -> str:
+    targets = {
+        "9:16": (1080, 1920),
+        "16:9": (1920, 1080),
+        "1:1": (1080, 1080),
+        "4:5": (1080, 1350),
+    }
+    if aspect_ratio not in targets:
+        return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    w, h = targets[aspect_ratio]
+    return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+
+
+def render_cuts(
+    input_path: Path,
+    selected: list[dict[str, Any]],
+    folder: Path,
+    keep_original_audio: bool,
+    aspect_ratio: str,
+) -> Path:
+    pieces = folder / "pieces"
+    if pieces.exists():
+        for old in pieces.glob("*.mp4"):
+            old.unlink(missing_ok=True)
+    pieces.mkdir(exist_ok=True)
+    concat_lines = []
+    source_has_audio = has_audio(input_path)
+    for i, seg in enumerate(selected):
+        piece = pieces / f"part-{i:03d}.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{seg['start']:.3f}",
+            "-to", f"{seg['end']:.3f}",
+            "-i", str(input_path),
+            "-vf", aspect_filter(aspect_ratio),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        ]
+        if keep_original_audio and source_has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"]
         else:
             cmd += ["-an"]
-        cmd += ["-movflags", "+faststart", str(out)]
+        cmd += ["-movflags", "+faststart", str(piece)]
         run(cmd)
-        clip_paths.append(out)
+        concat_lines.append(f"file '{piece.as_posix()}'")
 
-    concat = folder / "concat.txt"
-    concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in clip_paths), encoding="utf-8")
+    manifest = folder / "concat.txt"
+    manifest.write_text("\n".join(concat_lines), encoding="utf-8")
     out = folder / "cuts.mp4"
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(out)])
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(manifest), "-c", "copy", str(out)])
     return out
 
 
 def tts(text: str, voice: str, out: Path) -> None:
-    if not text.strip() or not os.getenv("OPENAI_API_KEY"):
-        return
     from openai import OpenAI
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required for voiceover generation")
     client = OpenAI()
     response = client.audio.speech.create(
         model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
@@ -387,119 +548,117 @@ def escape_drawtext(text: str) -> str:
     return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'").replace("%", "\\%")
 
 
-def srt_time(seconds: float) -> str:
-    ms = max(0, int(round(seconds * 1000)))
-    h, rem = divmod(ms, 3600000)
-    m, rem = divmod(rem, 60000)
-    s, milli = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
+def _caption_style(style: str) -> str:
+    if style == "minimal":
+        return "FontName=DejaVu Sans,FontSize=18,Outline=1,Shadow=0,Alignment=2,MarginV=50"
+    if style == "clean":
+        return "FontName=DejaVu Sans,FontSize=22,Bold=1,Outline=2,Shadow=0,Alignment=2,MarginV=58"
+    return "FontName=DejaVu Sans,FontSize=28,Bold=1,Outline=3,Shadow=1,Alignment=2,MarginV=72"
 
 
-def create_srt(folder: Path, plan: dict[str, Any]) -> Path | None:
-    transcript = read_json(folder / "transcript.json", []) or []
-    if not transcript:
-        return None
-    rows = []
-    timeline_cursor = 0.0
-    index = 1
-    for clip in plan.get("segments", []):
-        source_start = float(clip["start"])
-        source_end = float(clip["end"])
-        clip_duration = source_end - source_start
-        for speech in transcript:
-            overlap_start = max(source_start, float(speech["start"]))
-            overlap_end = min(source_end, float(speech["end"]))
-            text = str(speech.get("text", "")).strip()
-            if overlap_end <= overlap_start or not text:
-                continue
-            out_start = timeline_cursor + (overlap_start - source_start)
-            out_end = timeline_cursor + (overlap_end - source_start)
-            rows.append(f"{index}\n{srt_time(out_start)} --> {srt_time(out_end)}\n{text}\n")
-            index += 1
-        timeline_cursor += clip_duration
-    if not rows:
-        return None
-    path = folder / "captions.srt"
-    path.write_text("\n".join(rows), encoding="utf-8")
-    return path
+def finish_render(
+    cuts: Path,
+    output: Path,
+    folder: Path,
+    plan: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    burn_captions: bool,
+    voice: str,
+    overlay_audio_path: str | None,
+    keep_original_audio: bool,
+    caption_style: str,
+) -> None:
+    video_filters = []
+    srt = folder / "captions.srt"
+    if burn_captions and create_srt(transcript, plan["segments"], srt):
+        escaped_srt = str(srt).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        video_filters.append(f"subtitles='{escaped_srt}':force_style='{_caption_style(caption_style)}'")
 
-
-def finish_render(cuts: Path, output: Path, folder: Path, plan: dict[str, Any], config: dict[str, Any]) -> None:
-    cmd = ["ffmpeg", "-y", "-i", str(cuts)]
-    voice_inputs = []
-    for i, item in enumerate(plan.get("voiceover", [])):
-        voice_file = folder / f"voice-{i:02d}.mp3"
-        tts(item["text"], str(config.get("voice", "alloy")), voice_file)
-        if voice_file.exists():
-            voice_inputs.append((voice_file, int(float(item["at"]) * 1000)))
-            cmd += ["-i", str(voice_file)]
-
-    overlay = config.get("overlay_audio_path")
-    overlay_index = None
-    if overlay and Path(overlay).exists() and plan.get("overlay_audio_at") is not None:
-        overlay_index = 1 + len(voice_inputs)
-        cmd += ["-i", str(overlay)]
-
-    filters = []
-    vf = []
-    if bool(config.get("burn_captions", True)):
-        srt = create_srt(folder, plan)
-        if srt:
-            escaped_srt = str(srt).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-            caption_style = str(config.get("caption_style", "social"))
-            if caption_style == "minimal":
-                style = "FontName=DejaVu Sans,FontSize=18,Outline=1,Alignment=2,MarginV=42"
-            elif caption_style == "clean":
-                style = "FontName=DejaVu Sans,FontSize=22,Bold=1,Outline=2,Alignment=2,MarginV=56"
-            else:
-                style = "FontName=DejaVu Sans,FontSize=28,Bold=1,Outline=3,Shadow=1,Alignment=2,MarginV=72"
-            vf.append(f"subtitles='{escaped_srt}':force_style='{style}'")
-    headline = str(plan.get("headline", "")).strip()
+    headline = plan.get("headline", "").strip()
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     if headline:
-        vf.append(
-            f"drawtext=fontfile='{font}':text='{escape_drawtext(headline)}':"
-            "fontcolor=white:fontsize=h/18:borderw=3:bordercolor=black@0.8:"
+        video_filters.append(
+            "drawtext="
+            f"fontfile='{font}':text='{escape_drawtext(headline)}':"
+            "fontcolor=white:fontsize=h/18:borderw=3:bordercolor=black@0.78:"
             "x=(w-text_w)/2:y=h*0.08:enable='between(t,0,3.5)'"
         )
+
     for item in plan.get("text_overlays", []):
-        at = float(item["at"]); end = at + float(item["duration"])
-        y = {"top": "h*0.12", "center": "(h-text_h)/2", "bottom": "h*0.78"}.get(item.get("position"), "(h-text_h)/2")
-        vf.append(
-            f"drawtext=fontfile='{font}':text='{escape_drawtext(item['text'])}':"
-            f"fontcolor=white:fontsize=h/16:borderw=3:bordercolor=black@0.8:"
-            f"x=(w-text_w)/2:y={y}:enable='between(t,{at:.3f},{end:.3f})'"
+        at = float(item.get("at", 0.0))
+        end = at + float(item.get("duration", 2.5))
+        position = item.get("position", "center")
+        y = {"top": "h*0.12", "center": "(h-text_h)/2", "bottom": "h*0.78"}.get(position, "(h-text_h)/2")
+        text = escape_drawtext(str(item.get("text", "")))
+        if not text:
+            continue
+        video_filters.append(
+            "drawtext="
+            f"fontfile='{font}':text='{text}':fontcolor=white:fontsize=h/16:"
+            f"borderw=3:bordercolor=black@0.8:x=(w-text_w)/2:y={y}:enable='between(t,{at:.3f},{end:.3f})'"
         )
-    if vf:
-        filters.append(f"[0:v]{','.join(vf)}[vout]")
+
+    voice_inputs: list[tuple[Path, int, float]] = []
+    for i, item in enumerate(plan.get("voiceover", [])):
+        clip = folder / f"voice-{i:02d}.mp3"
+        tts(item["text"], voice, clip)
+        duration = ffprobe_duration(clip)
+        voice_inputs.append((clip, int(round(float(item["at"]) * 1000)), duration))
+
+    overlay: tuple[Path, int] | None = None
+    if overlay_audio_path and Path(overlay_audio_path).exists() and plan.get("overlay_audio_at") is not None:
+        overlay = (Path(overlay_audio_path), int(round(float(plan["overlay_audio_at"]) * 1000)))
+
+    cmd = ["ffmpeg", "-y", "-i", str(cuts)]
+    for clip, _delay, _duration in voice_inputs:
+        cmd += ["-i", str(clip)]
+    if overlay:
+        cmd += ["-i", str(overlay[0])]
+
+    filter_parts = []
+    if video_filters:
+        filter_parts.append(f"[0:v]{','.join(video_filters)}[vout]")
 
     audio_labels = []
-    if bool(config.get("keep_original_audio", True)) and has_audio(cuts):
-        filters.append("[0:a]volume=1.0[base]")
-        audio_labels.append("[base]")
+    base_audio = has_audio(cuts) and keep_original_audio
+    if base_audio:
+        current = "[0:a]"
+        if voice_inputs:
+            for i, (_clip, delay_ms, duration) in enumerate(voice_inputs):
+                start = delay_ms / 1000.0
+                end = start + duration
+                out_label = f"[duck{i}]"
+                filter_parts.append(f"{current}volume=0.28:enable='between(t,{start:.3f},{end:.3f})'{out_label}")
+                current = out_label
+        filter_parts.append(f"{current}anull[abase]")
+        audio_labels.append("[abase]")
 
-    for i, (_path, delay) in enumerate(voice_inputs):
-        idx = i + 1
-        filters.append(f"[{idx}:a]adelay={delay}|{delay},volume=1.0[vo{i}]")
-        audio_labels.append(f"[vo{i}]")
+    input_index = 1
+    for i, (_clip, delay, _duration) in enumerate(voice_inputs):
+        label = f"[vo{i}]"
+        filter_parts.append(f"[{input_index}:a]adelay={delay}|{delay},volume=1.0{label}")
+        audio_labels.append(label)
+        input_index += 1
 
-    if overlay_index is not None:
-        delay = int(float(plan["overlay_audio_at"]) * 1000)
-        filters.append(f"[{overlay_index}:a]adelay={delay}|{delay},volume=0.95[sfx]")
-        audio_labels.append("[sfx]")
+    if overlay:
+        label = "[sfx]"
+        filter_parts.append(f"[{input_index}:a]adelay={overlay[1]}|{overlay[1]},volume=0.92{label}")
+        audio_labels.append(label)
 
-    if len(audio_labels) > 1:
-        filters.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest[aout]")
+    if len(audio_labels) >= 2:
+        filter_parts.append(f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=2[aout]")
     elif len(audio_labels) == 1:
-        filters.append(f"{audio_labels[0]}anull[aout]")
+        filter_parts.append(f"{audio_labels[0]}anull[aout]")
 
-    if filters:
-        cmd += ["-filter_complex", ";".join(filters)]
-        cmd += ["-map", "[vout]" if vf else "0:v"]
+    if filter_parts:
+        cmd += ["-filter_complex", ";".join(filter_parts)]
+        cmd += ["-map", "[vout]" if video_filters else "0:v"]
         if audio_labels:
             cmd += ["-map", "[aout]"]
     else:
-        cmd += ["-map", "0:v", "-map", "0:a?"]
+        cmd += ["-map", "0:v"]
+        if has_audio(cuts):
+            cmd += ["-map", "0:a?"]
 
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
     if audio_labels or has_audio(cuts):
@@ -511,18 +670,18 @@ def finish_render(cuts: Path, output: Path, folder: Path, plan: dict[str, Any], 
 def _load_frames(folder: Path) -> list[dict[str, Any]]:
     scenes = read_json(folder / "scenes.json", []) or []
     by_id = {int(s["id"]): s for s in scenes}
-    result = []
-    frame_dir = folder / "frames"
-    if not frame_dir.exists():
-        return result
-    for p in sorted(frame_dir.glob("scene-*.jpg")):
+    frames = []
+    for p in sorted((folder / "frames").glob("scene-*.jpg")) if (folder / "frames").exists() else []:
         try:
             sid = int(p.stem.split("-")[-1])
-            scene = by_id[sid]
-            result.append({"scene_id": sid, "time": round(scene["start"] + scene["duration"] / 2, 3), "path": p})
         except Exception:
-            pass
-    return result
+            continue
+        scene = by_id.get(sid)
+        if not scene:
+            continue
+        mid = scene["start"] + (scene["end"] - scene["start"]) / 2
+        frames.append({"scene_id": sid, "time": round(mid, 3), "path": p})
+    return frames
 
 
 def analyze_and_plan_job(job_id: str, input_path: Path, config: dict[str, Any], write_status: StatusWriter) -> None:
@@ -533,24 +692,33 @@ def analyze_and_plan_job(job_id: str, input_path: Path, config: dict[str, Any], 
         scenes = detect_scenes(input_path, duration)
         write_json(folder / "scenes.json", scenes)
 
-        write_status(job_id, {"progress": 25, "message": f"Detected {len(scenes)} scene(s)"})
+        write_status(job_id, {"progress": 24, "message": f"Detected {len(scenes)} scene(s)"})
         frames = extract_frames(input_path, scenes, folder)
         audio = extract_audio(input_path, folder)
 
-        write_status(job_id, {"progress": 40, "message": "Transcribing speech"})
+        write_status(job_id, {"progress": 38, "message": "Transcribing speech"})
         transcript = transcribe(audio)
         write_json(folder / "transcript.json", transcript)
 
-        write_status(job_id, {"state": "planning", "progress": 58, "message": "AI is building the timeline"})
-        plan = ai_plan(config["edit_prompt"], config.get("narration_text", ""), scenes, transcript, frames, config.get("overlay_audio_at"))
+        write_status(job_id, {"state": "planning", "progress": 56, "message": "AI is building the first timeline"})
+        plan = ai_plan(
+            config["edit_prompt"],
+            config.get("narration_text", ""),
+            scenes,
+            transcript,
+            frames,
+            config.get("overlay_audio_at"),
+        )
         write_json(plan_path(job_id), plan)
 
         write_status(job_id, {
-            "state": "planned", "progress": 100, "message": "Timeline ready to review",
+            "state": "planned",
+            "progress": 100,
+            "message": "Timeline ready to review",
             "plan_url": f"/api/jobs/{job_id}/plan",
             "manifest_url": f"/api/jobs/{job_id}/manifest",
-            "summary": plan["summary"],
-            "timeline_duration": plan["timeline"]["duration"],
+            "summary": plan.get("summary", ""),
+            "timeline_duration": plan.get("timeline", {}).get("duration", 0),
         })
     except Exception as exc:
         (folder / "error.txt").write_text(str(exc), encoding="utf-8")
@@ -562,35 +730,71 @@ def replan_existing_job(job_id: str, config: dict[str, Any], write_status: Statu
     try:
         scenes = read_json(folder / "scenes.json", []) or []
         transcript = read_json(folder / "transcript.json", []) or []
-        plan = ai_plan(config["edit_prompt"], config.get("narration_text", ""), scenes, transcript, _load_frames(folder), config.get("overlay_audio_at"))
+        frames = _load_frames(folder)
+        plan = ai_plan(
+            config["edit_prompt"],
+            config.get("narration_text", ""),
+            scenes,
+            transcript,
+            frames,
+            config.get("overlay_audio_at"),
+        )
         write_json(plan_path(job_id), plan)
         write_status(job_id, {
-            "state": "planned", "progress": 100, "message": "AI revision ready",
-            "summary": plan["summary"], "timeline_duration": plan["timeline"]["duration"],
+            "state": "planned",
+            "progress": 100,
+            "message": "AI revision ready",
+            "summary": plan.get("summary", ""),
+            "timeline_duration": plan.get("timeline", {}).get("duration", 0),
         })
     except Exception as exc:
+        (folder / "error.txt").write_text(str(exc), encoding="utf-8")
         write_status(job_id, {"state": "error", "progress": 100, "message": str(exc)[-1800:]})
 
 
 def render_existing_job(job_id: str, config: dict[str, Any], write_status: StatusWriter) -> None:
     folder = job_dir(job_id)
-    source = next((p for p in folder.glob("input.*") if p.is_file()), None)
-    if not source:
+    input_path = next((p for p in folder.glob("input.*") if p.is_file()), None)
+    if not input_path:
         write_status(job_id, {"state": "error", "progress": 100, "message": "Source video is missing"})
         return
     try:
         plan = read_json(plan_path(job_id), None)
         if not plan:
             raise RuntimeError("Edit plan is missing")
+        transcript = read_json(folder / "transcript.json", []) or []
+
         write_status(job_id, {"state": "rendering", "progress": 72, "message": "Cutting selected clips"})
-        cuts = render_cuts(source, plan["segments"], folder, bool(config.get("keep_original_audio", True)), str(config.get("aspect_ratio", "original")))
-        write_status(job_id, {"progress": 88, "message": "Mixing text, voice and sound"})
+        cuts = render_cuts(
+            input_path,
+            plan["segments"],
+            folder,
+            bool(config.get("keep_original_audio", True)),
+            str(config.get("aspect_ratio", "original")),
+        )
+
+        write_status(job_id, {"progress": 86, "message": "Mixing captions, voice and sound"})
         output = folder / "output.mp4"
-        finish_render(cuts, output, folder, plan, config)
+        finish_render(
+            cuts=cuts,
+            output=output,
+            folder=folder,
+            plan=plan,
+            transcript=transcript,
+            burn_captions=bool(config.get("burn_captions", True)),
+            voice=str(config.get("voice", "alloy")),
+            overlay_audio_path=config.get("overlay_audio_path"),
+            keep_original_audio=bool(config.get("keep_original_audio", True)),
+            caption_style=str(config.get("caption_style", "social")),
+        )
+
         write_status(job_id, {
-            "state": "done", "progress": 100, "message": "Render complete",
+            "state": "done",
+            "progress": 100,
+            "message": "Render complete",
             "download_url": f"/api/jobs/{job_id}/download",
-            "plan_url": f"/api/jobs/{job_id}/plan", "summary": plan["summary"],
+            "plan_url": f"/api/jobs/{job_id}/plan",
+            "summary": plan.get("summary", ""),
         })
     except Exception as exc:
         (folder / "error.txt").write_text(str(exc), encoding="utf-8")
