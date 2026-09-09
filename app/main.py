@@ -24,10 +24,12 @@ LEGACY_STATIC = BASE_DIR / "static"
 LEGACY_TEMPLATE = BASE_DIR / "templates" / "index.html"
 
 app = FastAPI(title="CutPilot AI", version="0.3.0")
+_cors_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
+_allow_all_origins = "*" in _cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
+    allow_origins=["*"] if _allow_all_origins else _cors_origins,
+    allow_credentials=not _allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
