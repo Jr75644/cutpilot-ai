@@ -26,6 +26,7 @@ export interface JobStatus {
 }
 
 export interface Segment {
+  clip_id?: string;
   scene_id: number;
   start: number;
   end: number;
@@ -63,8 +64,8 @@ export interface EditPlan {
   summary: string;
   segments: Segment[];
   headline: string;
-  voiceover: Array<{ at: number; text: string }>;
-  text_overlays: Array<{ at: number; duration: number; text: string; position: string }>;
+  voiceover: Array<{ id?: string; at: number; text: string }>;
+  text_overlays: Array<{ id?: string; at: number; duration: number; text: string; position: string }>;
   overlay_audio_at: number | null;
   timeline: Timeline;
 }
