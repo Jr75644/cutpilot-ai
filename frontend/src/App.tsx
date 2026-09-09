@@ -3,7 +3,7 @@ import { api } from './api';
 import Timeline from './components/Timeline';
 import Inspector from './components/Inspector';
 import PreviewStage from './components/PreviewStage';
-import { clipById, deleteClip, getTrack, splitVideoClip } from './editor';
+import { clipById, deleteClip, getTrack, splitVideoClip } from './timelineOps';
 import type { EditPlan, Health, JobStatus, Manifest, TimelineClip } from './types';
 
 const starterPrompt = 'Make this feel intentional and polished. Remove dead space, keep the strongest visual beats, preserve important dialogue, use clean cuts, and do not add music unless I explicitly ask for it.';
