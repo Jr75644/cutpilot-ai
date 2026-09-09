@@ -45,3 +45,6 @@ class TimelinePatch(BaseModel):
 class RenderRequest(BaseModel):
     aspect_ratio: Literal["original", "9:16", "16:9", "1:1", "4:5"] | None = None
     caption_style: Literal["clean", "social", "minimal"] | None = None
+    burn_captions: bool | None = None
+    keep_original_audio: bool | None = None
+    voice: str | None = None

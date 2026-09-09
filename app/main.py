@@ -23,7 +23,7 @@ FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 LEGACY_STATIC = BASE_DIR / "static"
 LEGACY_TEMPLATE = BASE_DIR / "templates" / "index.html"
 
-app = FastAPI(title="CutPilot AI", version="0.2.0")
+app = FastAPI(title="CutPilot AI", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -65,7 +65,7 @@ def _safe_download_name(name: str) -> str:
 def health() -> dict[str, Any]:
     return {
         "ok": True,
-        "version": "0.2.0",
+        "version": "0.3.0",
         "ai_configured": bool(os.getenv("OPENAI_API_KEY")),
         "editor_model": os.getenv("OPENAI_EDITOR_MODEL", "gpt-5.6-luna"),
         "transcribe_provider": os.getenv("TRANSCRIBE_PROVIDER", "openai"),
@@ -272,6 +272,12 @@ def render_job(job_id: str, payload: RenderRequest, background_tasks: Background
         config["aspect_ratio"] = payload.aspect_ratio
     if payload.caption_style:
         config["caption_style"] = payload.caption_style
+    if payload.burn_captions is not None:
+        config["burn_captions"] = payload.burn_captions
+    if payload.keep_original_audio is not None:
+        config["keep_original_audio"] = payload.keep_original_audio
+    if payload.voice:
+        config["voice"] = payload.voice
     write_json(config_path(job_id), config)
     write_status(job_id, {"state": "rendering", "progress": 68, "message": "Rendering timeline"})
     background_tasks.add_task(render_existing_job, job_id, config, write_status)
