@@ -28,10 +28,10 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ plan }),
     }).then(json<EditPlan>),
-  render: (id: string, aspect_ratio: string, caption_style: string) =>
+  render: (id: string, aspect_ratio: string, caption_style: string, burn_captions: boolean, keep_original_audio: boolean, voice: string) =>
     fetch(`${API_BASE}/api/jobs/${id}/render`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ aspect_ratio, caption_style }),
+      body: JSON.stringify({ aspect_ratio, caption_style, burn_captions, keep_original_audio, voice }),
     }).then(json<{ job_id: string; state: string }>),
 };
