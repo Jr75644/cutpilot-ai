@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: cutpilot-ai
+    runtime: docker
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_EDITOR_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: whisper-1
+      - key: OPENAI_TTS_MODEL
+        value: gpt-4o-mini-tts
+      - key: TRANSCRIBE_PROVIDER
+        value: openai
+      - key: MAX_UPLOAD_MB
+        value: "1500"
+      - key: SCENE_THRESHOLD
+        value: "27"
+      - key: DATA_DIR
+        value: /app/data
