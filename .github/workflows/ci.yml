@@ -16,8 +16,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install -r requirements.txt
       - run: python -m compileall app
-      - run: python scripts/smoke_timeline.py
-      - run: python scripts/smoke_render.py
+      - run: python smoke_timeline.py
+      - run: python smoke_render.py
 
   frontend:
     runs-on: ubuntu-latest
