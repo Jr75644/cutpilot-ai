@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CutPilot AI — Prompt-to-Edit Video Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="noise"></div>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="logo">CP</span><div><strong>CutPilot AI</strong><small>prompt-to-edit video studio</small></div></div>
+      <div id="apiPill" class="pill">Checking AI…</div>
+    </header>
+
+    <section class="hero">
+      <div>
+        <span class="eyebrow">AI VIDEO EDITOR</span>
+        <h1>Tell it what the clip should <em>feel</em> like.<br>Let the timeline build itself.</h1>
+        <p>Upload a video, describe the edit in plain English, add optional narration or a sound effect, and CutPilot analyzes scenes, speech and frames before rendering a new MP4.</p>
+      </div>
+      <div class="flow-card">
+        <div><b>01</b><span>Read scenes + speech</span></div>
+        <div><b>02</b><span>AI builds edit plan</span></div>
+        <div><b>03</b><span>FFmpeg renders MP4</span></div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <form id="editorForm" class="panel form-panel">
+        <div class="panel-head"><div><span class="dot"></span> NEW EDIT</div><small>Everything runs as one job</small></div>
+
+        <label class="upload" id="dropZone">
+          <input id="video" name="video" type="file" accept="video/*" required />
+          <span class="upload-icon">↥</span>
+          <strong id="videoLabel">Drop a video here</strong>
+          <small>or tap to choose from your device</small>
+        </label>
+
+        <label>
+          <span>Edit prompt</span>
+          <textarea name="edit_prompt" rows="6" required placeholder="Example: Make this a tense 25-second horror clip. Start with the calm living room, cut to the long hallway, hold on the door for suspense, remove dead space, no music, and keep the Ring-style alert sound I upload. Add captions only when someone speaks."></textarea>
+        </label>
+
+        <label>
+          <span>Narration / exact words to say <i>optional</i></span>
+          <textarea name="narration_text" rows="4" placeholder="Example: I thought the alert was nothing… until I saw the door at the end of the hallway."></textarea>
+        </label>
+
+        <div class="two-col">
+          <label><span>Voice</span><select name="voice"><option>alloy</option><option>ash</option><option>coral</option><option>echo</option><option>fable</option><option>nova</option><option>onyx</option><option>sage</option><option>shimmer</option></select></label>
+          <label><span>Sound effect time <i>optional</i></span><input name="overlay_audio_at" type="number" min="0" step="0.1" placeholder="AI decides if blank" /></label>
+        </div>
+
+        <label class="sfx-upload"><span>Sound effect / extra audio <i>optional</i></span><input name="overlay_audio" type="file" accept="audio/*" /></label>
+
+        <div class="toggles">
+          <label class="check"><input name="burn_captions" type="checkbox" checked /><span></span> Burn speech captions</label>
+          <label class="check"><input name="keep_original_audio" type="checkbox" checked /><span></span> Keep original audio</label>
+        </div>
+
+        <button id="runButton" class="run" type="submit"><span>Generate AI edit</span><b>→</b></button>
+      </form>
+
+      <aside class="panel result-panel">
+        <div class="panel-head"><div><span class="dot purple"></span> LIVE JOB</div><small id="stateLabel">Waiting for video</small></div>
+        <div class="preview" id="preview">
+          <div class="empty-preview"><span>◫</span><strong>Your rendered video appears here</strong><small>The AI edit plan will be shown below it.</small></div>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-meta"><span id="progressMessage">Nothing running yet</span><b id="progressPct">0%</b></div>
+          <div class="progress"><div id="progressBar"></div></div>
+        </div>
+        <div id="summary" class="summary hidden"></div>
+        <div id="actions" class="actions hidden"><a id="downloadButton" class="download" href="#">Download MP4</a><button id="planButton" type="button">View edit plan</button></div>
+        <pre id="planView" class="plan hidden"></pre>
+      </aside>
+    </section>
+
+    <section class="feature-grid">
+      <article><span>VISUAL</span><h3>Scene-aware cuts</h3><p>Detects visual changes, samples frames, and lets the AI choose what footage to keep.</p></article>
+      <article><span>SPEECH</span><h3>Transcript-aware timing</h3><p>Speech is transcribed so the edit can preserve lines, remove empty space, and burn captions.</p></article>
+      <article><span>AUDIO</span><h3>Voice + SFX layers</h3><p>Prompt-driven TTS narration and an uploaded sound effect can be placed on the final timeline.</p></article>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

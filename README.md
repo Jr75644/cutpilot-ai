@@ -1,134 +1,120 @@
-# CutPilot AI v0.2
+# CutPilot AI v0.3
 
-CutPilot is an AI-native video editor starter: import a source clip, describe the finished edit in plain English, let the system analyze scenes/speech/frames, review the AI-built multi-track timeline, revise it conversationally, then render an MP4.
+CutPilot is an AI-native, non-destructive video editor. Import a source video, describe the finished edit in plain English, let the system analyze scenes/speech/frames, then review and manually refine the same multi-track timeline the AI created before rendering an MP4.
 
-The important design decision in v0.2 is that **AI planning and rendering are separate**. The model edits structured timeline data first. FFmpeg only renders after the timeline is reviewed/approved.
+## v0.3 editor pass
 
-## What changed from v0.1
+v0.3 turns the v0.2 timeline visualization into an actual editing surface:
 
-The original starter proved the pipeline, but it was basically a form plus one long processing job. v0.2 restructures it into a real editor foundation:
+- drag video clips horizontally to reorder the cut;
+- drag text, voiceover, and SFX clips to retime them;
+- trim video clips with edge handles while respecting detected scene boundaries;
+- trim text-overlay duration with edge handles;
+- split video at the playhead;
+- delete clips (with protection against deleting the final video clip);
+- undo/redo history (50 checkpoints);
+- timeline zoom;
+- ruler scrubbing and a real moving playhead;
+- pre-render timeline playback that jumps through the source according to the edited cut;
+- keyboard shortcuts: Space play/pause, S split, Delete remove, Cmd/Ctrl+Z undo, Cmd/Ctrl+S save;
+- 900 ms debounced autosave plus explicit Save;
+- stale renders automatically return to `planned` after timeline changes;
+- stable clip IDs survive backend validation/saves;
+- backend now treats the saved timeline order as the render order, including split clips and reordered scenes;
+- render-time settings (captions, source audio, voice, format) are saved immediately before export;
+- CI smoke test verifies a reordered + split timeline round-trips into the correct render decision list.
 
-- React + TypeScript editor workspace instead of one static form.
-- Media/project panel, AI assistant, preview stage, inspector, recent jobs, and multi-track timeline.
-- `upload -> analyze -> plan -> review/revise -> render` workflow.
-- Iterative AI re-planning without re-uploading the source video.
-- Timeline plan can be patched before render.
-- Video, text, voiceover, and SFX tracks are represented separately in the UI.
-- 9:16, 16:9, 1:1, 4:5, and original export formats.
-- Three caption style presets.
-- Narration voice generation + automatic original-audio ducking.
-- Safer upload limits and job-id/path validation.
-- Multi-stage Docker build compiles the React frontend and serves it from FastAPI.
+## Core workflow
 
-## Current workflow
+1. **Import** a source video and optional sound effect.
+2. **Prompt** CutPilot in natural language.
+3. **Analyze** with PySceneDetect + FFmpeg + timestamped transcription.
+4. **Plan** with a multimodal AI model using real scene boundaries, transcript context, and representative frames.
+5. **Edit** the generated Video / Text / Voiceover / SFX timeline manually or ask AI to revise it.
+6. **Autosave** the canonical timeline JSON.
+7. **Render** the exact saved timeline with FFmpeg, captions, narration, audio ducking, reframing, and SFX.
+8. **Preview/download** the MP4.
 
-1. Import a video.
-2. Enter an edit prompt, for example:
+Example prompt:
 
-   > Start in the living room. Cut to the hallway and hold on the door at the end for suspense. Remove dead space. No music. Keep the Ring-style alert I upload and put it where the notification occurs. Add my narration over the clip.
-
-3. CutPilot detects scenes with PySceneDetect, extracts representative frames with FFmpeg, and transcribes speech.
-4. The AI receives real scene boundaries, transcript context, frames, and your instruction.
-5. A typed edit plan is created and exposed as a multi-track timeline.
-6. Review source in/out points in the Inspector or ask the AI to revise the timeline.
-7. Choose export format/captions and click **Render video**.
-8. FFmpeg cuts, reframes, captions, mixes narration/SFX, and exports the final MP4.
+> Start in the living room. Cut to the hallway sooner and hold on the door for suspense. Remove dead space. No music. Put my Ring alert where the notification happens and add my narration over it.
 
 ## Architecture
 
 ```text
-React / TypeScript editor
+React / TypeScript NLE
         |
+        |  timeline JSON (canonical edit state)
         v
-FastAPI project + job API
+FastAPI project API
         |
         +--> PySceneDetect scene analysis
-        +--> FFmpeg frames/audio
-        +--> Whisper / faster-whisper transcription
+        +--> FFmpeg frames/audio/probing
+        +--> Whisper/faster-whisper transcription
         +--> multimodal AI timeline planner
         |
         v
-Validated timeline JSON
+Validated non-destructive timeline
         |
         v
-FFmpeg renderer + TTS + audio mix
+FFmpeg renderer + captions + TTS + audio mix
         |
         v
 MP4 export
 ```
 
-See `ARCHITECTURE.md` for the detailed design and `ROADMAP.md` for the build sequence.
+The critical design rule is: **AI edits timeline data; FFmpeg renders timeline data.** AI never directly destroys the uploaded source.
 
 ## Repository layout
 
 ```text
 app/
   main.py                 FastAPI routes + job lifecycle
-  models.py               typed planner/request models
+  models.py               typed API/planner models
   processor.py            analysis, AI planning, validation, rendering
-  storage.py              local job storage helpers
-  static/ + templates/    legacy v0.1 fallback UI
+  storage.py              local project/job storage
 
 frontend/
-  src/App.tsx             complete editor workspace
+  src/App.tsx             editor state, autosave, undo/redo, shortcuts
+  src/editor.ts            shared non-destructive timeline operations
   src/components/
-    PreviewStage.tsx
-    Inspector.tsx
-    Timeline.tsx
-  src/api.ts              frontend API client
-  src/types.ts            timeline/job types
-  src/styles.css          full editor styling
+    PreviewStage.tsx       cut-aware source preview + transport
+    Inspector.tsx          selected-clip/project editing
+    Timeline.tsx           drag, trim, split controls, zoom, scrub
+  src/api.ts               typed API client
+  src/types.ts             timeline/job types
+  src/styles.css           editor UI styling
 
-Dockerfile                multi-stage React + Python build
-render.yaml               Render deployment blueprint
+scripts/smoke_timeline.py  timeline/render-order smoke test
+Dockerfile                 multi-stage frontend + API build
+render.yaml                Render deployment blueprint
+.github/workflows/ci.yml   backend + frontend CI
 ```
 
-## Run with Docker (recommended)
-
-1. Copy the environment file:
+## Run with Docker
 
 ```bash
 cp .env.example .env
-```
-
-2. Add your API key to `.env`.
-
-3. Build:
-
-```bash
+# put OPENAI_API_KEY in .env
 docker build -t cutpilot-ai .
-```
-
-4. Run:
-
-```bash
 docker run --rm -p 8000:8000 --env-file .env -v cutpilot-data:/app/data cutpilot-ai
 ```
 
-5. Open `http://localhost:8000`.
-
-The Docker build installs/builds the React frontend first, then copies `frontend/dist` into the FastAPI image.
+Open `http://localhost:8000`.
 
 ## Local developer mode
 
-### Backend
-
-Python 3.11+ and FFmpeg are required.
+Backend (Python 3.11+ and FFmpeg):
 
 ```bash
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-# source .venv/bin/activate
-
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-### Frontend
-
-Node 22+ is recommended.
+Frontend (Node 22+):
 
 ```bash
 cd frontend
@@ -136,54 +122,42 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Vite proxies `/api` to the FastAPI server on port 8000.
+Open `http://localhost:5173`; Vite proxies `/api` to port 8000.
 
-## Local/offline transcription
+## Local transcription
 
 ```bash
 pip install -r requirements-local.txt
 ```
-
-Then:
 
 ```env
 TRANSCRIBE_PROVIDER=local
 WHISPER_MODEL=small
 ```
 
-The model downloads on first use.
-
 ## Main API routes
 
-- `POST /api/jobs` — upload source + create initial AI analysis job.
+- `POST /api/jobs` — upload source + begin analysis.
 - `GET /api/jobs` — recent jobs.
 - `GET /api/jobs/{id}` — status/progress.
 - `GET /api/jobs/{id}/manifest` — scenes, transcript, frames, config, plan.
-- `GET /api/jobs/{id}/plan` — current timeline plan.
-- `PATCH /api/jobs/{id}/plan` — save manual timeline edits.
-- `POST /api/jobs/{id}/replan` — ask AI to revise the existing analysis/timeline.
-- `POST /api/jobs/{id}/render` — render the approved plan.
+- `GET /api/jobs/{id}/plan` — canonical edit plan.
+- `PATCH /api/jobs/{id}/plan` — validate/autosave manual timeline edits.
+- `POST /api/jobs/{id}/replan` — ask AI to revise analysis/timeline.
+- `POST /api/jobs/{id}/render` — render approved timeline + current export settings.
 - `GET /api/jobs/{id}/source` — source preview.
-- `GET /api/jobs/{id}/download` — finished MP4.
+- `GET /api/jobs/{id}/download` — final MP4.
 
-## Open-source building blocks
+## Current limitations
 
-- **PySceneDetect** — visual cut/transition detection.
-- **FFmpeg** — media probing, frame/audio extraction, cut/re-encode, captions, mixing, export.
-- **faster-whisper** — optional local transcription.
-- **React + Vite** — editor workspace.
+v0.3 is a serious editor foundation, not yet CapCut/Premiere parity:
 
-The UI/timeline glue code in this starter is original. A later phase can add Remotion for richer motion graphics or adopt ideas/components from open-source NLE projects, but the core timeline should stay provider-independent.
+- Video-track movement is ripple/reorder editing rather than free gaps/overlaps.
+- One uploaded SFX asset is supported per project.
+- Voiceover clip width is an estimate until TTS audio is generated.
+- Preview is cut-aware for source video but does not yet live-compose text/captions/voice/SFX before render.
+- Vertical reframing is center crop, not subject/face tracking yet.
+- Caption rendering is subtitle-based, not word-by-word animated social captions yet.
+- Jobs use FastAPI background tasks + local disk; production still needs queue workers and object storage.
 
-## Important current limitations
-
-v0.2 is a strong product foundation, not yet Premiere/CapCut-level editing:
-
-- Timeline clips are selectable and source ranges can be edited numerically; true drag/trim handles are Phase 2.
-- Vertical reframing is currently a center crop, not face/subject tracking yet.
-- One uploaded SFX layer is supported.
-- Jobs still run in FastAPI background tasks and local storage. Production needs a queue + object storage.
-- Preview is source/final video playback, not yet a frame-perfect live composition preview of every unrendered timeline change.
-- Caption rendering is subtitle-based; word-by-word animated social captions are planned.
-
-Those limitations are intentional boundaries so the architecture stays clean while the editor grows.
+See `ROADMAP.md` for the next build sequence.

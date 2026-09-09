@@ -4,12 +4,12 @@
 
 The AI should **edit a timeline**, not directly mutate video files. Every AI action becomes structured timeline data that a deterministic renderer can validate, display, revise, and export.
 
-## Current v0.2 flow
+## Current v0.3 flow
 
 1. **Import** — browser uploads source video and optional SFX.
 2. **Analyze** — FastAPI worker reads duration, detects visual scenes, extracts representative frames, and transcribes speech.
 3. **Plan** — multimodal AI receives the user's edit prompt + scene manifest + transcript context + representative frames and returns a typed edit plan.
-4. **Review** — React UI displays the plan as multi-track timeline data. The user can inspect/trim source ranges and ask AI to revise the existing plan without re-uploading.
+4. **Review** — React UI displays the plan as a multi-track timeline. The user can drag/reorder, trim, split, delete, retime non-video clips, undo/redo, scrub the cut-aware preview, and ask AI to revise the existing plan without re-uploading.
 5. **Render** — FFmpeg executes the approved cuts, aspect-ratio transform, captions, text overlays, TTS narration, audio ducking, and uploaded SFX.
 6. **Export** — browser previews/downloads the final MP4.
 
@@ -30,7 +30,7 @@ frontend/
 
 ## Why the plan/render split matters
 
-The first prototype did everything in one background task. That is fast to prove but hard to turn into a real editor. v0.2 creates an explicit `planned` state and a separate render command. This makes the following possible without redesigning the backend:
+The first prototype did everything in one background task. v0.2 separated planning from rendering; v0.3 makes the saved timeline the canonical render state and adds interactive non-destructive operations. This makes the following possible without redesigning the backend:
 
 - drag/trim/reorder timeline clips;
 - ask the AI to revise an existing timeline;

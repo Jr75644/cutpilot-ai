@@ -1,58 +1,82 @@
 # CutPilot roadmap
 
-## Phase 1 — editor foundation (current)
+## Phase 1 — AI editor foundation ✅
 
-- React/TypeScript NLE-style workspace
-- import/source preview
-- AI scene + transcript analysis
+- React/TypeScript NLE workspace
+- upload/source preview
+- AI scene + transcript + frame analysis
 - structured edit plan
-- multi-track timeline visualization
+- Video / Text / Voiceover / SFX tracks
 - project inspector
-- iterative AI re-plan
-- aspect ratios + captions + narration + one SFX layer
+- iterative AI re-planning
+- aspect ratios, captions, narration, SFX
 - explicit review before rendering
 
-## Phase 2 — make the timeline truly editable
+## Phase 2 — interactive timeline ✅ / in progress
+
+Completed in v0.3:
 
 - draggable/reorderable video clips
-- trim handles with snap-to-scene/speech boundaries
-- split/delete/duplicate actions
+- draggable text, voiceover, SFX timing
+- video trim handles constrained to scene bounds
+- text duration trim handles
+- split at playhead
+- delete selected clip
 - undo/redo history
-- draggable text, voice, and SFX clips
-- waveform thumbnails
-- timeline zoom + playhead scrubbing synced to preview
-- non-destructive project save/versioning
+- timeline zoom
+- scrub/playhead synced to cut-aware source preview
+- keyboard editing shortcuts
+- debounced autosave
+- timeline becomes the backend/render source of truth
+- stable clip IDs across save validation
+
+Next inside Phase 2:
+
+- true audio waveform extraction/rendering
+- timeline snapping to cuts, playhead, speech boundaries, and neighboring clips
+- duplicate clip command
+- multi-select / range select
+- copy/paste
+- project version snapshots beyond in-session undo history
+- live preview composition for overlays/audio before final render
 
 ## Phase 3 — stronger automatic editing
 
-- silence/filler-word removal
+- automatic silence removal using transcript/audio analysis
+- filler-word removal
 - word-level transcript editing (delete words = cut footage)
-- auto reframing / face & subject tracking for 9:16
-- cutaway/B-roll suggestions from user-owned media
+- semantic scene memory ("the hallway", "when he turns around")
+- auto reframing / face and subject tracking for 9:16
+- user-media B-roll suggestions
 - beat detection and optional music synchronization
-- smart audio cleanup, loudness normalization, ducking envelopes
+- audio cleanup/loudness normalization
+- editable ducking envelopes and volume keyframes
 - transition/effect library
-- caption templates with word highlighting
+- animated word-highlight caption templates
 
 ## Phase 4 — production platform
 
 - accounts/authentication
-- projects + folders + autosave
-- resumable uploads
-- S3/R2 storage
-- background worker queue
-- render presets / quality choices
-- share links and cloud exports
-- usage/cost controls
-- project collaboration
+- projects + folders
+- resumable direct-to-object-storage uploads
+- S3/R2 media storage + signed URLs
+- Postgres metadata
+- Redis + render worker queue
+- WebSocket/SSE job progress
+- render quality presets
+- share links/cloud exports
+- usage and cost controls
+- collaboration
 
-## Phase 5 — AI-native editing assistant
+## Phase 5 — AI-native timeline commands
 
-- conversational timeline operations such as:
-  - “hold on the hallway door for two seconds longer”
-  - “remove every pause over 0.7 sec”
-  - “put the Ring sound exactly when the notification appears”
-  - “make the first 3 seconds stronger for TikTok”
-  - “keep my wording but make the narration sound more uneasy”
-- AI actions returned as patch operations so every change is previewable and undoable
-- scene memory so the editor can refer to visual moments semantically (“the hallway,” “when he turns around,” “the red car”)
+Move from full timeline re-plans to explicit previewable patch operations:
+
+- “hold on the hallway door two seconds longer”
+- “remove every pause over 0.7 seconds”
+- “put the Ring sound exactly when the notification appears”
+- “make the first three seconds stronger for TikTok”
+- “move that narration after he turns around”
+- “undo only the last AI change”
+
+Every AI operation should be human-readable, previewable, undoable, and apply to the exact same timeline operations used by manual editing.
